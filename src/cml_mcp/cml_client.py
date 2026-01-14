@@ -35,7 +35,7 @@ logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(thr
 logger = logging.getLogger(__name__)
 
 
-class CMLClient(object):
+class CMLClient:
     """
     Async client for interacting with the CML API.
     Handles authentication and provides methods to fetch system and lab information.
@@ -188,6 +188,11 @@ class CMLClient(object):
             if resp.status_code == 204:  # No content
                 return None
             return resp.json()
+        except httpx.HTTPStatusError as e:
+            # Log the response body for debugging API errors
+            error_body = e.response.text
+            logger.error(f"HTTP {e.response.status_code} error from POST {url}: {error_body}")
+            raise e
         except httpx.RequestError as e:
             logger.error(f"Error making POST request to {url}: {e}", exc_info=True)
             raise e
@@ -205,6 +210,11 @@ class CMLClient(object):
             if resp.status_code == 204:  # No content
                 return None
             return resp.json()
+        except httpx.HTTPStatusError as e:
+            # Log the response body for debugging API errors
+            error_body = e.response.text
+            logger.error(f"HTTP {e.response.status_code} error from PUT {url}: {error_body}")
+            raise e
         except httpx.RequestError as e:
             logger.error(f"Error making PUT request to {url}: {e}", exc_info=True)
             raise e

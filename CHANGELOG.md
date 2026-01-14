@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Improved error logging**: HTTP POST/PUT methods now log response body on 4xx/5xx errors
+  - Helps diagnose CML API errors (e.g., invalid node definitions, missing fields)
+
 ### Added
 
 - **E2E Test Script**: Standalone HTTP service validation (`scripts/test_http_e2e.py`)

@@ -88,153 +88,191 @@ if settings.cml_mcp_transport == "http":
     )
 
 
-# Provide a custom token validation function.
-class CustomRequestMiddleware(Middleware):
-    async def on_request(self, context: MiddlewareContext, call_next) -> Any:
-        # Reset PyATS env vars
-        os.environ.pop("PYATS_USERNAME", None)
-        os.environ.pop("PYATS_PASSWORD", None)
-        os.environ.pop("PYATS_AUTH_PASS", None)
+# Authentication middleware for CML MCP server.
+#
+# DESIGN DECISION (AD-14): Allow unauthenticated tool discovery
+# ============================================================
+# Tool discovery (tools/list) does NOT require CML credentials because:
+# 1. The tool list is static and doesn't depend on a specific CML server
+# 2. This enables tools-provider to discover tools without needing CML secrets
+# 3. Runtime environment variables (CML_HOST, credentials) are provided per-request
+#    when the agent calls the tool, not during discovery
+#
+# Tool EXECUTION (on_call_tool) requires full authentication:
+# - X-CML-Server-URL header or default CML_URL
+# - X-Authorization: Basic <credentials>
 
-        headers = get_http_headers()
 
-        # === CML Server URL (with fallback) ===
-        cml_url = headers.get("x-cml-server-url")
-        if not cml_url:
-            # Fallback to configured default
-            if settings.cml_url:
-                cml_url = str(settings.cml_url)
-            else:
-                raise McpError(
-                    ErrorData(
-                        message="Missing X-CML-Server-URL header and no default CML_URL configured",
-                        code=-31002,
-                    )
-                )
+async def _authenticate_cml_request() -> tuple[str, bool]:
+    """Authenticate and set up CML client for a request.
 
-        # === SSL Verification ===
-        verify_ssl_header = headers.get("x-cml-verify-ssl", "").lower()
-        if verify_ssl_header:
-            verify_ssl = verify_ssl_header == "true"
+    Returns:
+        Tuple of (cml_url, verify_ssl) for cleanup.
+
+    Raises:
+        McpError: If authentication fails.
+    """
+    # Reset PyATS env vars
+    os.environ.pop("PYATS_USERNAME", None)
+    os.environ.pop("PYATS_PASSWORD", None)
+    os.environ.pop("PYATS_AUTH_PASS", None)
+
+    headers = get_http_headers()
+
+    # === CML Server URL (with fallback) ===
+    cml_url = headers.get("x-cml-server-url")
+    if not cml_url:
+        # Fallback to configured default
+        if settings.cml_url:
+            cml_url = str(settings.cml_url)
         else:
-            verify_ssl = settings.cml_verify_ssl
-
-        # === CML Credentials ===
-        auth_header = headers.get("x-authorization")
-        if not auth_header or not auth_header.startswith("Basic "):
             raise McpError(
                 ErrorData(
-                    message="Unauthorized: Missing or invalid X-Authorization header",
+                    message="Missing X-CML-Server-URL header and no default CML_URL configured",
                     code=-31002,
                 )
             )
-        parts = auth_header.split(" ", 1)
-        if len(parts) != 2 or parts[0].lower() != "basic":
+
+    # === SSL Verification ===
+    verify_ssl_header = headers.get("x-cml-verify-ssl", "").lower()
+    if verify_ssl_header:
+        verify_ssl = verify_ssl_header == "true"
+    else:
+        verify_ssl = settings.cml_verify_ssl
+
+    # === CML Credentials ===
+    auth_header = headers.get("x-authorization")
+    if not auth_header or not auth_header.startswith("Basic "):
+        raise McpError(
+            ErrorData(
+                message="Unauthorized: Missing or invalid X-Authorization header",
+                code=-31002,
+            )
+        )
+    parts = auth_header.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "basic":
+        raise McpError(
+            ErrorData(
+                message="Invalid X-Authorization header format. Expected 'Basic <credentials>'",
+                code=-31001,
+            )
+        )
+    try:
+        decoded = base64.b64decode(parts[1]).decode("utf-8")
+        username, password = decoded.split(":", 1)
+    except Exception:
+        raise McpError(
+            ErrorData(
+                message="Failed to decode Basic authentication credentials",
+                code=-31002,
+            )
+        )
+
+    # === Get client from pool ===
+    if cml_pool is None:
+        raise McpError(
+            ErrorData(
+                message="Internal error: Client pool not initialized",
+                code=-31002,
+            )
+        )
+    try:
+        client = await cml_pool.get_client(cml_url, username, password, verify_ssl)
+        current_cml_client.set(client)
+    except McpError:
+        raise
+    except Exception as e:
+        raise McpError(
+            ErrorData(
+                message=f"Failed to get CML client: {str(e)}",
+                code=-31002,
+            )
+        )
+
+    # === Authenticate with CML ===
+    try:
+        # Reset token for stateless operation
+        client.token = None
+        client.admin = None
+        await client.check_authentication()
+    except Exception as e:
+        raise McpError(
+            ErrorData(
+                message=f"Unauthorized: {str(e)}",
+                code=-31002,
+            )
+        )
+
+    # === PyATS Headers ===
+    pyats_header = headers.get("x-pyats-authorization")
+    if pyats_header and pyats_header.startswith("Basic "):
+        pyats_parts = pyats_header.split(" ", 1)
+        if len(pyats_parts) != 2 or pyats_parts[0].lower() != "basic":
             raise McpError(
                 ErrorData(
-                    message="Invalid X-Authorization header format. Expected 'Basic <credentials>'",
+                    message="Invalid X-PyATS-Authorization header format. Expected 'Basic <credentials>'",
                     code=-31001,
                 )
             )
         try:
-            decoded = base64.b64decode(parts[1]).decode("utf-8")
-            username, password = decoded.split(":", 1)
+            pyats_decoded = base64.b64decode(pyats_parts[1]).decode("utf-8")
+            pyats_username, pyats_password = pyats_decoded.split(":", 1)
+            os.environ["PYATS_USERNAME"] = pyats_username
+            os.environ["PYATS_PASSWORD"] = pyats_password
         except Exception:
             raise McpError(
                 ErrorData(
-                    message="Failed to decode Basic authentication credentials",
+                    message="Failed to decode Basic authentication credentials for PyATS",
                     code=-31002,
                 )
             )
 
-        # === Get client from pool ===
-        if cml_pool is None:
-            raise McpError(
-                ErrorData(
-                    message="Internal error: Client pool not initialized",
-                    code=-31002,
-                )
-            )
-        try:
-            client = await cml_pool.get_client(cml_url, username, password, verify_ssl)
-            current_cml_client.set(client)
-        except McpError:
-            raise
-        except Exception as e:
-            raise McpError(
-                ErrorData(
-                    message=f"Failed to get CML client: {str(e)}",
-                    code=-31002,
-                )
-            )
-
-        # === Authenticate with CML ===
-        try:
-            # Reset token for stateless operation
-            client.token = None
-            client.admin = None
-            await client.check_authentication()
-        except Exception as e:
-            raise McpError(
-                ErrorData(
-                    message=f"Unauthorized: {str(e)}",
-                    code=-31002,
-                )
-            )
-
-        # === PyATS Headers ===
-        pyats_header = headers.get("x-pyats-authorization")
-        if pyats_header and pyats_header.startswith("Basic "):
-            pyats_parts = pyats_header.split(" ", 1)
-            if len(pyats_parts) != 2 or pyats_parts[0].lower() != "basic":
+        pyats_enable_header = headers.get("x-pyats-enable")
+        if pyats_enable_header and pyats_enable_header.startswith("Basic "):
+            pyats_enable_parts = pyats_enable_header.split(" ", 1)
+            if len(pyats_enable_parts) != 2 or pyats_enable_parts[0].lower() != "basic":
                 raise McpError(
                     ErrorData(
-                        message="Invalid X-PyATS-Authorization header format. Expected 'Basic <credentials>'",
+                        message="Invalid X-PyATS-Enable header format. Expected 'Basic <credentials>'",
                         code=-31001,
                     )
                 )
             try:
-                pyats_decoded = base64.b64decode(pyats_parts[1]).decode("utf-8")
-                pyats_username, pyats_password = pyats_decoded.split(":", 1)
-                os.environ["PYATS_USERNAME"] = pyats_username
-                os.environ["PYATS_PASSWORD"] = pyats_password
+                pyats_enable_decoded = base64.b64decode(pyats_enable_parts[1]).decode("utf-8")
+                os.environ["PYATS_AUTH_PASS"] = pyats_enable_decoded
             except Exception:
                 raise McpError(
                     ErrorData(
-                        message="Failed to decode Basic authentication credentials for PyATS",
+                        message="Failed to decode Basic authentication credentials for PyATS Enable",
                         code=-31002,
                     )
                 )
 
-            pyats_enable_header = headers.get("x-pyats-enable")
-            if pyats_enable_header and pyats_enable_header.startswith("Basic "):
-                pyats_enable_parts = pyats_enable_header.split(" ", 1)
-                if len(pyats_enable_parts) != 2 or pyats_enable_parts[0].lower() != "basic":
-                    raise McpError(
-                        ErrorData(
-                            message="Invalid X-PyATS-Enable header format. Expected 'Basic <credentials>'",
-                            code=-31001,
-                        )
-                    )
-                try:
-                    pyats_enable_decoded = base64.b64decode(pyats_enable_parts[1]).decode("utf-8")
-                    os.environ["PYATS_AUTH_PASS"] = pyats_enable_decoded
-                except Exception:
-                    raise McpError(
-                        ErrorData(
-                            message="Failed to decode Basic authentication credentials for PyATS Enable",
-                            code=-31002,
-                        )
-                    )
+    return cml_url, verify_ssl
 
-        # === Execute request and cleanup ===
+
+async def _cleanup_cml_request(cml_url: str, verify_ssl: bool) -> None:
+    """Cleanup after a CML request."""
+    if cml_pool is not None:
+        await cml_pool.release_client(cml_url, verify_ssl)
+    current_cml_client.set(None)
+
+
+class CustomRequestMiddleware(Middleware):
+    """Middleware that requires authentication only for tool execution.
+
+    Tool discovery (on_list_tools) is allowed without authentication
+    so tools-provider can discover available tools. The actual CML
+    credentials are provided at runtime when calling tools.
+    """
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next) -> Any:
+        """Handle tool execution - requires CML authentication."""
+        cml_url, verify_ssl = await _authenticate_cml_request()
         try:
             return await call_next(context)
         finally:
-            # Release client back to pool
-            if cml_pool is not None:
-                await cml_pool.release_client(cml_url, verify_ssl)
-            current_cml_client.set(None)
+            await _cleanup_cml_request(cml_url, verify_ssl)
 
 
 if settings.cml_mcp_transport == "http":
